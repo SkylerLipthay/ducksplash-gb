@@ -46,11 +46,17 @@ ClearOam:
 	dec b
 	jp nz, ClearOam
 
-	; Load and position the duck.
+	; Initialize variables and position the duck.
+	ld a, 254
+	ld [wRand], a
+	ld a, 60
+	ld [wNewFish], a
 	ld a, %00000000
 	ld [wDuckFlags], a
 	ld a, 0
 	ld [wDuckBob], a
+	ld a, 0
+	ld [wDuckOpen], a
 	ld a, 72
 	ld [wDuckX], a
 	ld b, a
@@ -73,11 +79,16 @@ ClearOam:
 Main:
 	call WaitVBlank
 
+	call StepRand
 	call UpdateKeys
 	call ProcessKeysH
 	call ProcessKeysV
 	call BobDuck
 	call ConstrainDuck
+	call SpawnFish
+	call MoveFish
+	call EatFish
+	call CloseDuckBill
 
 	; Adjust duck position
 	ld a, [wDuckX]
@@ -164,9 +175,15 @@ MACRO PutTileIndexAndFlags
 PositionDuck:
 	; b = x
 	; c = y
-	; Modifies a, d, h, l
+	; Modifies a, d, e, h, l
 	;
 	ld hl, _OAMRAM
+	ld e, OBJ_TILE_DUCK_CLOSED
+	ld a, [wDuckOpen]
+	or a, a
+	jp z, PositionDuckBillClosed
+	ld e, OBJ_TILE_DUCK_OPEN
+PositionDuckBillClosed:
 	ld a, [wDuckFlags]
 	ld d, a
 	and a, %00100000
@@ -175,7 +192,7 @@ PositionDuckLeft:
 	PutTileIndexAndFlags OBJ_TILE_DUCK_HEAD_02,0,0
 	PutTileIndexAndFlags OBJ_TILE_DUCK_HEAD_01,8,0
 	PutTileIndexAndFlags OBJ_TILE_DUCK_HEAD_00,16,0
-	PutTileIndexAndFlags OBJ_TILE_DUCK_CLOSED,0,8
+	PutTileIndexAndFlags e,0,8
 	PutTileIndexAndFlags OBJ_TILE_DUCK_HEAD_11,8,8
 	PutTileIndexAndFlags OBJ_TILE_DUCK_HEAD_10,16,8
 	PutTileIndexAndFlags OBJ_TILE_DUCK_TAIL_0,24,8
@@ -195,7 +212,7 @@ PositionDuckRight:
 	PutTileIndexAndFlags OBJ_TILE_DUCK_TAIL_0,0,8
 	PutTileIndexAndFlags OBJ_TILE_DUCK_HEAD_10,8,8
 	PutTileIndexAndFlags OBJ_TILE_DUCK_HEAD_11,16,8
-	PutTileIndexAndFlags OBJ_TILE_DUCK_CLOSED,24,8
+	PutTileIndexAndFlags e,24,8
 	PutTileIndexAndFlags OBJ_TILE_DUCK_TAIL_1,0,16
 	PutTileIndexAndFlags OBJ_TILE_DUCK_MIDDLE,8,16
 	PutTileIndexAndFlags OBJ_TILE_DUCK_MIDDLE,16,16
@@ -257,6 +274,7 @@ ProcessKeysH:
 	dec a
 	dec a
 	ld [wDuckX], a
+	jp ProcessKeysHAddRand
 ProcessKeysHCheckRight:
 	ld a, [wCurKeys]
 	and a, PADF_RIGHT
@@ -267,6 +285,10 @@ ProcessKeysHCheckRight:
 	inc a
 	inc a
 	ld [wDuckX], a
+ProcessKeysHAddRand:
+	ld a, [wRand]
+	add a, 33
+	ld [wRand], a
 ProcessKeysHEnd:
 	ret
 
@@ -278,6 +300,7 @@ ProcessKeysV:
 	dec a
 	dec a
 	ld [wDuckY], a
+	jp ProcessKeysVAddRand
 ProcessKeysVCheckDown:
 	ld a, [wCurKeys]
 	and a, PADF_DOWN
@@ -286,7 +309,279 @@ ProcessKeysVCheckDown:
 	inc a
 	inc a
 	ld [wDuckY], a
+ProcessKeysVAddRand:
+	ld a, [wRand]
+	sub a, 12
+	ld [wRand], a
 ProcessKeysVEnd:
+	ret
+
+StepRand:
+	; Simple LCG: a = (5 * a + 1) % 256
+	ld a, [wRand]
+	ld b, a
+	add a, a
+	add a, a
+	add a, b
+	inc a
+	ld [wRand], a
+	ret
+
+SpawnFish:
+	ld a, [wNewFish]
+	dec a
+	jp nz, SpawnFishEnd
+
+	ld hl, _OAMRAM + OAM_OFF_FISH_FIRST
+	ld de, 8
+	ld b, MAX_FISH_COUNT
+SpawnFishLocateEmpty:
+	ld a, 0
+	cp a, [hl]
+	jp nz, SpawnFishLocateEmptyContinue
+
+	ld c, 115
+	call StepRand
+	; a is filled with a new random number as a result of StepRand:
+SpawnFishCalculateYModulo:
+	cp a, c
+	jp c, SpawnFishCalculateYModuloEnd
+	sub a, c
+	jp SpawnFishCalculateYModulo
+
+SpawnFishCalculateYModuloEnd:
+	add a, 24
+	ld c, a
+	; c is now a random number between 24 and 138 (inclusive). Note that there is some unequal
+	; distribution, i.e. some positions are much more likely as others. Oh well!
+
+	; Set the Y position:
+	ld [hli], a
+
+	; Let's get another random number in b to decide what type of fish this is, and whether it should
+	; be facing left or right.
+	ld a, [wRand]
+	ld b, a
+
+	; Use this bit to determine flip orientation (happens to be the OAM X flip bit):
+	and a, %00100000
+	jp nz, SpawnFishSetXRight
+	; signed -7:
+	ld a, 249
+	jp SpawnFishSetXFinish
+SpawnFishSetXRight:
+	ld a, 167
+SpawnFishSetXFinish:
+	ld d, a
+	; Set the X position:
+	ld [hli], a
+
+	ld a, b
+	; OK, this is magic. Load a couple bits from b (the random value).
+	and a, %01100000
+	rlca
+	rlca
+	rlca
+	; Now, the bit used to determine X flip is the least significant bit, and a previously unused bit
+	; is the second least significant bit. So, the X flip bit determines whether we're pointing to
+	; OBJ_TILE_FISH_x_0 or OBJ_TILE_FISH_x_1. The second least significant bit determines whether
+	; we're pointing to OBJ_TILE_FISH_0_x or OBJ_TILE_FISH_1_x.
+	add a, OBJ_TILE_FISH_0_0
+	ld e, a
+	; Now e either points to OBJ_TILE_FISH_0_0, OBJ_TILE_FISH_1_0, OBJ_TILE_FISH_0_1, or
+	; OBJ_TILE_FISH_1_1. Simple!
+
+	; The shark (OBJ_TILE_FISH_2_x) is a rare fish. Let's give it a 1 in 8 chance by utilizing 2 bits
+	; of b:
+	ld a, b
+	and a, %00000110
+	jp nz, SpawnFishNotShark
+	ld a, e
+	; Note: This will either promote FISH_0 to FISH_1, or FISH_1 to FISH_2. This incidentally makes
+	; FISH_1 more common than FISH_0.
+	add a, 2
+	ld e, a
+
+SpawnFishNotShark:
+	ld a, e
+	ld [hli], a
+
+	; Set the flags (X flip):
+	ld a, b
+	and a, %00100000
+	ld [hli], a
+
+	ld a, c
+	ld [hli], a
+	ld a, d
+	add a, 8
+	ld [hli], a
+	; Load e into a, and then flip its least signifcant bit. This depends on the OBJ_TILE_FISH_0_x
+	; indexes all being even numbers!
+	ld a, e
+	xor a, %00000001
+	ld [hli], a
+	ld a, b
+	and a, %00100000
+	ld [hli], a
+
+	jp SpawnFishRandomize
+
+SpawnFishLocateEmptyContinue:
+	add hl, de
+	dec b
+	jp nz, SpawnFishLocateEmpty
+
+SpawnFishRandomize:
+	ld a, [wRand]
+	srl a
+	add a, 10
+SpawnFishEnd:
+	ld [wNewFish], a
+	ret
+
+MoveFish:
+	ld e, MAX_FISH_COUNT
+	ld hl, _OAMRAM + OAM_OFF_FISH_FIRST
+MoveFishContinue:
+	inc hl
+	ld a, [hl]
+	; Test if a >= 168 && a <= 248. If it is, mark y = 0 for both tiles and move on to the next fish
+	; slot.
+	cp a, 168
+	jp c, MoveFishOnScreen
+	cp a, 249
+	jp nc, MoveFishOnScreen
+	dec hl
+	ld a, 0
+	ld [hli], a
+	inc hl
+	inc hl
+	inc hl
+	ld [hli], a
+	inc hl
+	inc hl
+	inc hl
+	jp MoveFishNext
+MoveFishOnScreen:
+	inc hl
+	inc hl
+	ld a, [hl]
+	dec hl
+	dec hl
+	and a, %00100000
+	jp nz, MoveFishLeft
+	inc [hl]
+	inc hl
+	inc hl
+	inc hl
+	inc hl
+	inc [hl]
+	inc hl
+	inc hl
+	inc hl
+	jp MoveFishNext
+MoveFishLeft:
+	dec [hl]
+	inc hl
+	inc hl
+	inc hl
+	inc hl
+	dec [hl]
+	inc hl
+	inc hl
+	inc hl
+MoveFishNext:
+	dec e
+	jp nz, MoveFishContinue
+	ret
+
+EatFish:
+	ld hl, _OAMRAM
+	ld a, [wDuckFlags]
+	ld d, 20
+	and a, %00100000
+	jp z, EatFishDuckRight
+	ld d, 3
+EatFishDuckRight:
+	ld e, MAX_FISH_COUNT
+	ld hl, _OAMRAM + OAM_OFF_FISH_FIRST
+	; Loop through all 4 fish.
+EatFishContinue:
+	ld a, [hl]
+	or a, a
+	; If fish.y == 0, skip to the next fish.
+	jp z, EatFishNext
+	ld c, a
+	inc hl
+	ld a, [hl]
+	add a, 16
+	ld b, a
+	dec hl
+	; Rough math:
+	;
+	; Duck bill = [wDuckX + 16, wDuckX + 24, wDuckY + 8, wDuckY + 16]
+	; Fish = [fish.x, fish.x + 16, fish.y, fish.y + 8]
+	;
+	; wDuckX + 16 >= fish.x + 16? skip to the next fish
+	; wDuckX + 24 <= fish.x? skip to the next fish
+	; wDuckY + 8 >= fish.y + 8? skip to the next fish
+	; wDuckY + 16 <= fish.y? skip to the next fish
+	;
+	; Don't forget to take into consideration the duck orientation! That's taken care of by the
+	; d register.
+	;
+	; b = fish.x
+	; c = fish.y
+	ld a, [wDuckX]
+	add a, d
+	cp a, b
+	jp nc, EatFishNext
+	add a, 24
+	cp a, b
+	jp c, EatFishNext
+	jp z, EatFishNext
+	ld a, [wDuckY]
+	cp a, c
+	jp nc, EatFishNext
+	add a, 16
+	cp a, c
+	jp c, EatFishNext
+	jp z, EatFishNext
+	ld [hl], 0
+	inc hl
+	inc hl
+	inc hl
+	inc hl
+	ld [hl], 0
+	ld a, 12
+	ld [wDuckOpen], a
+	jp EatFishNextHalf
+EatFishNext:
+	dec e
+	jp z, EatFishRet
+	inc hl
+	inc hl
+	inc hl
+	inc hl
+EatFishNextHalf:
+	inc hl
+	inc hl
+	inc hl
+	inc hl
+	jp EatFishContinue
+EatFishRet:
+	ret
+
+CloseDuckBill:
+	ld a, [wDuckOpen]
+	or a, a
+	jp z, CloseDuckBillRet
+	dec a
+	ld [wDuckOpen], a
+	or a, a
+	jp nz, CloseDuckBillRet
+CloseDuckBillRet:
 	ret
 
 Tiles:
@@ -303,33 +598,39 @@ ObjectsEnd:
 
 SECTION "Variables", WRAM0
 
+wRand: db
+wNewFish: db
 wDuckX: db
 wDuckY: db
+wDuckOpen: db
 wDuckFlags: db
 wDuckBob: db
 wCurKeys: db
 wNewKeys: db
 
-DEF OBJ_TILE_EMPTY EQU 0
-DEF OBJ_TILE_DUCK_HEAD_00 EQU 1
-DEF OBJ_TILE_DUCK_HEAD_01 EQU 2
-DEF OBJ_TILE_DUCK_HEAD_02 EQU 3
-DEF OBJ_TILE_DUCK_BUBBLE EQU 4
-DEF OBJ_TILE_DUCK_TAIL_0 EQU 5
-DEF OBJ_TILE_DUCK_HEAD_10 EQU 6
-DEF OBJ_TILE_DUCK_HEAD_11 EQU 7
-DEF OBJ_TILE_DUCK_CLOSED EQU 8
-DEF OBJ_TILE_DUCK_OPEN EQU 9
-DEF OBJ_TILE_FISH_0_0 EQU 10
-DEF OBJ_TILE_FISH_0_1 EQU 11
-DEF OBJ_TILE_DUCK_TAIL_1 EQU 12
-DEF OBJ_TILE_DUCK_MIDDLE EQU 13
-DEF OBJ_TILE_DUCK_BREAST EQU 14
-DEF OBJ_TILE_FISH_1_0 EQU 15
-DEF OBJ_TILE_FISH_1_1 EQU 16
-DEF OBJ_TILE_DUCK_BOTTOM_0 EQU 17
-DEF OBJ_TILE_DUCK_BOTTOM_1 EQU 18
-DEF OBJ_TILE_DUCK_BOTTOM_2 EQU 19
-DEF OBJ_TILE_DUCK_BOTTOM_3 EQU 20
-DEF OBJ_TILE_FISH_2_0 EQU 21
-DEF OBJ_TILE_FISH_2_1 EQU 22
+DEF OBJ_TILE_DUCK_HEAD_00 EQU 0
+DEF OBJ_TILE_DUCK_HEAD_01 EQU 1
+DEF OBJ_TILE_DUCK_HEAD_02 EQU 2
+DEF OBJ_TILE_DUCK_TAIL_0 EQU 3
+DEF OBJ_TILE_DUCK_HEAD_10 EQU 4
+DEF OBJ_TILE_DUCK_HEAD_11 EQU 5
+DEF OBJ_TILE_DUCK_CLOSED EQU 6
+DEF OBJ_TILE_DUCK_OPEN EQU 7
+DEF OBJ_TILE_DUCK_TAIL_1 EQU 8
+DEF OBJ_TILE_DUCK_MIDDLE EQU 9
+DEF OBJ_TILE_DUCK_BREAST EQU 10
+DEF OBJ_TILE_DUCK_BOTTOM_0 EQU 11
+DEF OBJ_TILE_DUCK_BOTTOM_1 EQU 12
+DEF OBJ_TILE_DUCK_BOTTOM_2 EQU 13
+DEF OBJ_TILE_DUCK_BOTTOM_3 EQU 14
+DEF OBJ_TILE_BUBBLE EQU 15
+DEF OBJ_TILE_FISH_0_0 EQU 16
+DEF OBJ_TILE_FISH_0_1 EQU 17
+DEF OBJ_TILE_FISH_1_0 EQU 18
+DEF OBJ_TILE_FISH_1_1 EQU 19
+DEF OBJ_TILE_FISH_2_0 EQU 20
+DEF OBJ_TILE_FISH_2_1 EQU 21
+
+DEF OAM_OFF_FISH_FIRST EQU 15 * 4
+; Each fish takes up 2 consecutive objects.
+DEF MAX_FISH_COUNT EQU 4
